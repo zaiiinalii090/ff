@@ -1,0 +1,145 @@
+name: RDP + VirtualBox + VRDP + Tailscale
+
+on:
+  workflow_dispatch:
+
+jobs:
+  setup-rdp-and-vm:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    env:
+      # Pinning version settings
+      # NOTE: Ensure these versions actually exist on download.virtualbox.org
+      VBOX_VER: "7.2.4"
+      VBOX_BUILD: "170995" 
+      EXT_PACK_NAME: "Oracle_VirtualBox_Extension_Pack-7.2.4.vbox-extpack"
+
+    steps:
+      # ==========================================
+      # PHASE 1: CHECKOUT REPO & PREP RDP
+      # ==========================================
+      - name: Checkout Repository
+        uses: actions/checkout@v2
+
+      - name: Configure Core RDP Settings
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          netsh advfirewall firewall add rule name="RDP-Tailscale-Host" dir=in action=allow protocol=TCP localport=3389
+          netsh advfirewall firewall add rule name="RDP-Tailscale-VM" dir=in action=allow protocol=TCP localport=33389
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User
+        run: |
+          $password = 'Zain.rty123'
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          if (Get-LocalUser -Name "Administrator" -ErrorAction SilentlyContinue) {
+              Set-LocalUser -Name "Administrator" -Password $securePass
+          } else {
+              New-LocalUser -Name "Administrator" -Password $securePass -AccountNeverExpires
+          }
+          Add-LocalGroupMember -Group "Administrators" -Member "Administrator" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "Administrator" -ErrorAction SilentlyContinue
+          echo "RDP_CREDS=$password" >> $env:GITHUB_ENV
+
+      - name: Keep Session Active
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fResetBroken" -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "IdleTimeout" -Value 0
+          powercfg.exe /change monitor-timeout-ac 0
+          powercfg.exe /change standby-timeout-ac 0
+
+      # ==========================================
+      # PHASE 2: INSTALL VIRTUALBOX & EXTENSION PACK
+      # ==========================================
+      - name: Set VirtualBox Config Path
+        run: |
+          New-Item -Path "C:\VirtualBoxConfig" -ItemType Directory -Force
+          [Environment]::SetEnvironmentVariable("VBOX_USER_HOME", "C:\VirtualBoxConfig", "Machine")
+
+      - name: Download VirtualBox Installer
+        run: |
+          $dest = "$env:USERPROFILE\Downloads"
+          if (-not (Test-Path $dest)) { New-Item -ItemType Directory -Path $dest | Out-Null }
+
+          $url = "https://download.virtualbox.org/virtualbox/${{ env.VBOX_VER }}/VirtualBox-${{ env.VBOX_VER }}-${{ env.VBOX_BUILD }}-Win.exe"
+          
+          Write-Host "Downloading Base from $url"
+          Invoke-WebRequest -Uri $url -OutFile "$dest\VirtualBox-Installer.exe" -UseBasicParsing
+
+      - name: Download Extension Pack
+        run: |
+          $dest = "$env:USERPROFILE\Downloads"
+          
+          $url = "https://download.virtualbox.org/virtualbox/${{ env.VBOX_VER }}/${{ env.EXT_PACK_NAME }}"
+          $outfile = "$dest\${{ env.EXT_PACK_NAME }}"
+          
+          Write-Host "Downloading Extension Pack from $url"
+          Invoke-WebRequest -Uri $url -OutFile $outfile -UseBasicParsing
+          
+          if (-not (Test-Path $outfile)) { 
+            Write-Error "Download failed. File not found at $outfile"
+            exit 1 
+          }
+
+      - name: Install VirtualBox & Extension Pack
+        run: |
+          $vbInstaller = "$env:USERPROFILE\Downloads\VirtualBox-Installer.exe"
+          $extPack = "$env:USERPROFILE\Downloads\${{ env.EXT_PACK_NAME }}"
+          $VBoxManage = "C:\Program Files\Oracle\VirtualBox\VBoxManage.exe"
+
+          # 1. Install VirtualBox Base
+          Write-Host "Installing VirtualBox Base..."
+          Start-Process -FilePath $vbInstaller -ArgumentList "--silent --ignore-reboot --msiparams ALLUSERS=2" -Wait
+          $env:Path += ";C:\Program Files\Oracle\VirtualBox"
+
+          # 2. Install Extension Pack (Silent Accept)
+          if ((Test-Path $VBoxManage) -and (Test-Path $extPack)) {
+              Write-Host "Installing Extension Pack..."
+              
+              # FIX: Use cmd.exe /c to handle the pipe explicitly. 
+              # This bypasses PowerShell's object parsing issues with stdin.
+              cmd.exe /c "echo y | `"$VBoxManage`" extpack install --replace `"$extPack`""
+              
+          } else {
+              Write-Error "VBoxManage or extension pack file not found."
+              exit 1
+          }
+
+      # ==========================================
+      # PHASE 4: DOWNLOAD & IMPORT VM, ENABLE VRDP
+      # ==========================================
+      - name: Download OVA
+        run: |
+          $dest = "$env:USERPROFILE\Downloads"
+          Invoke-WebRequest `
+            -Uri "https://pub-4e3db5ccea8a4f30ae7d4ee15e71f566.r2.dev/Nadeem.ova" `
+            -OutFile "$dest\Nadeem.ova" `
+            -UseBasicParsing
+
+      - name: Import VM and Enable VRDP
+        run: |
+          $VBoxManage = "C:\Program Files\Oracle\VirtualBox\VBoxManage.exe"
+          $dest = "$env:USERPROFILE\Downloads"
+          $ovaPath = "$dest\Nadeem.ova"
+          $vmName = "NadeemVM"
+
+          & $VBoxManage import "$ovaPath" --vsys 0 --vmname "$vmName" --eula accept
+          & $VBoxManage modifyvm "$vmName" --vrde on
+          & $VBoxManage modifyvm "$vmName" --vrdeport 33389
+          # Bind to 0.0.0.0 so it listens on the Tailscale interface
+          & $VBoxManage modifyvm "$vmName" --vrdeaddress 0.0.0.0
+          & $VBoxManage modifyvm "$vmName" --vrdeauthtype null
+          & $VBoxManage startvm "$vmName" --type headless
+          Start-Sleep -Seconds 10
+          & $VBoxManage showvminfo "$vmName" | Select-String "VRDE"
+
+      - name: Connection Info
+        run: |
+          Write-Host "`n=============================================="
+          Write-Host "       VRDP CONNECTION DETAILS"
+          Write-Host "=============================================="
+          Write-Host "Target: $($env:TAILSCALE_IP):33389"
+          Write-Host "==============================================`n"
+          while ($true) { Start-Sleep -Seconds 300 }
